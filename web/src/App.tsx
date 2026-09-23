@@ -4,6 +4,7 @@ import { Scene } from "./components/Scene";
 import {
   buildPayload,
   validateDraft,
+  type CalibrationPairDraft,
   type CircleDraft,
   type FormDraft,
   type NodeDraft,
@@ -38,6 +39,13 @@ function NumInput(props: {
   );
 }
 
+const emptyPair = (): CalibrationPairDraft => ({
+  surveyX: "",
+  surveyY: "",
+  pathX: "",
+  pathY: "",
+});
+
 const initialDraft: FormDraft = {
   cableRadius: "5",
   nodes: [
@@ -45,6 +53,9 @@ const initialDraft: FormDraft = {
     { x: "100", y: "0" },
   ],
   circles: [{ x: "0", y: "15", radius: "10" }],
+  calibrationEnabled: false,
+  maxRmsError: "1",
+  calibrationPairs: [emptyPair(), emptyPair()],
 };
 
 const fmt = (n: number) => String(n);
@@ -166,6 +177,14 @@ export function App() {
     setDraft((d) => ({
       ...d,
       circles: d.circles.map((c, idx) => (idx === i ? { ...c, ...patch } : c)),
+    }));
+  };
+  const updatePair = (i: number, patch: Partial<CalibrationPairDraft>) => {
+    setDraft((d) => ({
+      ...d,
+      calibrationPairs: d.calibrationPairs.map((p, idx) =>
+        idx === i ? { ...p, ...patch } : p,
+      ),
     }));
   };
 
@@ -379,6 +398,140 @@ export function App() {
             </ol>
           </section>
 
+          <section>
+            <div className="row-head">
+              <h2>现场标定（可选）：全站仪 → 施工坐标</h2>
+              <label className="calibration-toggle">
+                <input
+                  type="checkbox"
+                  data-testid="calibration-enabled"
+                  checked={draft.calibrationEnabled}
+                  onChange={(e) =>
+                    setDraft((d) => ({ ...d, calibrationEnabled: e.target.checked }))
+                  }
+                />
+                启用控制点标定
+              </label>
+            </div>
+            {draft.calibrationEnabled && (
+              <div className="calibration-editor" data-testid="calibration-editor">
+                <p className="hint">
+                  钻孔中心来自全站仪坐标系；录入 2～20 对现场控制点，后端按最小二乘
+                  拟合「旋转 + 平移」刚体变换（不缩放、不镜像）后再做绕孔预检。
+                </p>
+                <div className="calibration-threshold">
+                  <span className="row-index">残差阈值（毫米，正数）</span>
+                  <NumInput
+                    value={draft.maxRmsError}
+                    testid="max-rms-error"
+                    ariaLabel="标定残差阈值（毫米）"
+                    invalid={hasErr(errors, "calibration.max_rms_error")}
+                    onChange={(v) => setDraft((d) => ({ ...d, maxRmsError: v }))}
+                  />
+                </div>
+                {err(errors, "calibration.max_rms_error") && (
+                  <p className="field-error" data-testid="err-calibration.max_rms_error">
+                    {err(errors, "calibration.max_rms_error")}
+                  </p>
+                )}
+                {hasErr(errors, "calibration") && (
+                  <p className="field-error" data-testid="err-calibration">
+                    {err(errors, "calibration")}
+                  </p>
+                )}
+                {(err(errors, "calibration.survey_points") ||
+                  err(errors, "calibration.path_points")) && (
+                  <p className="field-error" data-testid="err-calibration-points">
+                    {err(errors, "calibration.survey_points") ??
+                      err(errors, "calibration.path_points")}
+                  </p>
+                )}
+                <ol className="rows" data-testid="calibration-pair-list">
+                  {draft.calibrationPairs.map((p, i) => (
+                    <li key={i} className="row pair-row">
+                      <span className="row-index">#{i}</span>
+                      <NumInput
+                        value={p.surveyX}
+                        testid={`pair-${i}-survey-x`}
+                        ariaLabel={`控制点 ${i} 全站仪 X`}
+                        invalid={hasErr(errors, `calibration.survey_points[${i}].x`)}
+                        onChange={(v) => updatePair(i, { surveyX: v })}
+                      />
+                      <NumInput
+                        value={p.surveyY}
+                        testid={`pair-${i}-survey-y`}
+                        ariaLabel={`控制点 ${i} 全站仪 Y`}
+                        invalid={hasErr(errors, `calibration.survey_points[${i}].y`)}
+                        onChange={(v) => updatePair(i, { surveyY: v })}
+                      />
+                      <NumInput
+                        value={p.pathX}
+                        testid={`pair-${i}-path-x`}
+                        ariaLabel={`控制点 ${i} 施工 X`}
+                        invalid={hasErr(errors, `calibration.path_points[${i}].x`)}
+                        onChange={(v) => updatePair(i, { pathX: v })}
+                      />
+                      <NumInput
+                        value={p.pathY}
+                        testid={`pair-${i}-path-y`}
+                        ariaLabel={`控制点 ${i} 施工 Y`}
+                        invalid={hasErr(errors, `calibration.path_points[${i}].y`)}
+                        onChange={(v) => updatePair(i, { pathY: v })}
+                      />
+                      <button
+                        type="button"
+                        className="btn ghost small"
+                        aria-label={`删除控制点 ${i}`}
+                        data-testid={`remove-pair-${i}`}
+                        disabled={draft.calibrationPairs.length <= 2}
+                        onClick={() =>
+                          setDraft((d) => ({
+                            ...d,
+                            calibrationPairs: d.calibrationPairs.filter(
+                              (_, idx) => idx !== i,
+                            ),
+                          }))
+                        }
+                      >
+                        删除
+                      </button>
+                      {(err(errors, `calibration.survey_points[${i}].x`) ||
+                        err(errors, `calibration.survey_points[${i}].y`) ||
+                        err(errors, `calibration.path_points[${i}].x`) ||
+                        err(errors, `calibration.path_points[${i}].y`)) && (
+                        <p className="field-error row-error">
+                          {err(errors, `calibration.survey_points[${i}].x`) ??
+                            err(errors, `calibration.survey_points[${i}].y`) ??
+                            err(errors, `calibration.path_points[${i}].x`) ??
+                            err(errors, `calibration.path_points[${i}].y`)}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+                <div className="row-head pair-add">
+                  <span className="hint">
+                    每行一对：全站仪 X/Y ↔ 施工 X/Y（{draft.calibrationPairs.length}/20 对）
+                  </span>
+                  <button
+                    type="button"
+                    className="btn small"
+                    data-testid="add-pair"
+                    disabled={draft.calibrationPairs.length >= 20}
+                    onClick={() =>
+                      setDraft((d) => ({
+                        ...d,
+                        calibrationPairs: [...d.calibrationPairs, emptyPair()],
+                      }))
+                    }
+                  >
+                    + 控制点对
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+
           <div className="actions">
             <button type="submit" className="btn primary" data-testid="submit" disabled={loading}>
               {loading ? "预检中…" : "开始预检"}
@@ -407,6 +560,29 @@ export function App() {
             <div className="banner error" data-testid="banner-error">
               <strong>预检未执行：</strong>
               存在 {Object.keys(errors).length} 个字段错误，旧结论已清除。请修正红色字段后重试。
+            </div>
+          )}
+
+          {result && result.calibration && (
+            <div className="interval-panel calibration-panel" data-testid="calibration-panel">
+              <h2 className="interval-title">
+                标定结果（survey → path 刚体变换，{result.calibration.point_count} 对控制点）
+              </h2>
+              <div className="calibration-summary">
+                <p data-testid="calibration-rms">
+                  残差 RMS：{fmt(result.calibration.rms_error)} mm
+                </p>
+                <p data-testid="calibration-rotation">
+                  旋转矩阵：[[{fmt(result.calibration.rotation[0][0])},{" "}
+                  {fmt(result.calibration.rotation[0][1])}], [
+                  {fmt(result.calibration.rotation[1][0])},{" "}
+                  {fmt(result.calibration.rotation[1][1])}]]
+                </p>
+                <p data-testid="calibration-translation">
+                  平移：({fmt(result.calibration.translation.x)},{" "}
+                  {fmt(result.calibration.translation.y)}) mm
+                </p>
+              </div>
             </div>
           )}
 

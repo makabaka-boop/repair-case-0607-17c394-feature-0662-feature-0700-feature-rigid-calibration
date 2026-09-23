@@ -74,28 +74,81 @@ A 为峰值活动圈数、R 为输出规模），事件以整数位掩码增量�
 前端对每次“新提交 / 字段校验失败 / 请求失败 / 重置”立即作废旧结论（含旧区间），
 并用请求序号忽略在途旧响应——**乱序返回的旧响应不能恢复旧区间**。
 
+## 现场标定（可选 calibration）
+
+隧道复测时，**钻孔中心来自全站仪坐标系，而电缆路径使用施工局部坐标**。
+请求可携带可选 `calibration`，先以现场控制点完成标定再执行绕孔预检：
+
+- `survey_points` / `path_points`：**2～20 对**控制点（全站仪坐标 ↔ 施工局部坐标），
+  两组**等长**、坐标**有限**且各自**不能全部重合**；`max_rms_error` 为**正数**残差阈值；
+- 后端以**未舍入双精度**求 survey → path 的**最小二乘保距刚体变换**——
+  只允许**旋转 + 平移**（去质心后 `θ = atan2(Σs'×p', Σs'·p')` 闭式解，
+  结构上 det = +1，**不得缩放、不得镜像**），并返回
+  `rotation`（2x2 行主序）、`translation`、`rms_error`（展示值三位小数）；
+- **输入退化或残差超阈值**时返回定位明确的 422
+  （`calibration.survey_points` / `calibration.path_points` /
+  `calibration.max_rms_error`），**不生成任何碰撞、侵入或复合侵入结果**；
+- 标定成功后**只变换禁入圈圆心**，半径、电缆路径与电缆半径维持现有语义，
+  再复用同一粗筛与精确几何链路——所有排序、区间拓扑和三位展示都来自
+  同一批未舍入结果（质心/协方差用 `math.fsum` 累加，残差在去质心坐标上
+  计算，全站仪 1e6 mm 大坐标下稳定）；
+- **省略 `calibration` 时请求与响应逐项兼容**（响应中 `calibration` 为 `null`）。
+
+前端提供成对控制点编辑（2～20 对，可增删）与残差、旋转矩阵、平移摘要；
+校验失败、请求失败、重置与乱序响应同样使标定结论作废旧。
+
+```json
+{
+  "nodes": [{"x": -100, "y": 0}, {"x": 100, "y": 0}],
+  "cable_radius": 5,
+  "circles": [{"x": 1000, "y": 2015, "radius": 10}],
+  "calibration": {
+    "survey_points": [{"x": 1000, "y": 2000}, {"x": 1100, "y": 2000}, {"x": 1000, "y": 2100}],
+    "path_points": [{"x": 0, "y": 0}, {"x": 100, "y": 0}, {"x": 0, "y": 100}],
+    "max_rms_error": 1
+  }
+}
+```
+
+响应新增（其余字段语义不变）：
+
+```json
+{
+  "calibration": {
+    "point_count": 3,
+    "rotation": [[1.0, 0.0], [0.0, 1.0]],
+    "translation": {"x": -1000.0, "y": -2000.0},
+    "rms_error": 0.0
+  }
+}
+```
+
 
 ## 技术栈
 
 - 后端：Python 3.12 + FastAPI + Pydantic v2（`api/`）
 - 前端：TypeScript + React 18 + Vite（`web/`），SVG 绘制路径、禁入圈与判定位置
 - 测试：pytest（穿越/端点/相切/圈内线段/排序/字段错误/连续侵入区间合并与独立边界/
-  粗筛不漏候选/20000×2000 稀疏性能）、Vitest + Testing Library
+  粗筛不漏候选/20000×2000 稀疏性能/标定独立矩阵核对与退化、镜像、大坐标）、
+  Vitest + Testing Library
   （录入校验、**真实 HTTP 请求**、首个碰撞高亮、侵入区间明细与 SVG 片段高亮、
-  拐点双相切合并、重叠禁入圈、乱序响应作废与旧结论清除）
+  拐点双相切合并、重叠禁入圈、标定摘要与 422 作废、乱序响应作废与旧结论清除）
 
 ## 目录
 
 ```
 api/                       FastAPI 服务
   app/geometry.py          自实现二维：最近点 + 碰撞检测 + 闭集区间/跨拐点合并/空间粗筛（双精度）
-  app/schemas.py           Pydantic 模型与字段级校验
+  app/calibration.py       survey→path 最小二乘刚体标定（仅旋转+平移，双精度，fsum 累加）
+  app/schemas.py           Pydantic 模型与字段级校验（含 calibration 结构校验）
   app/main.py              /api/precheck、/api/health、422 字段错误
-  tests/                   pytest（碰撞、区间语义、合并边界、性能与错误）
+  tests/                   pytest（碰撞、区间语义、合并边界、性能与错误、
+                           标定：独立矩阵计算核对纯平移/九十度旋转/噪声/超阈值/
+                           退化/镜像/大坐标，标定后相切与复合侵入同源性）
 web/                       React + Vite
-  src/lib/validation.ts    前端同构校验（字段键与后端一致）
+  src/lib/validation.ts    前端同构校验（字段键与后端一致，含 calibration.*）
   src/components/Scene.tsx SVG 场景（路径/禁入圈/扩张圈/判定位置/侵入区间片段）
-  src/test/App.real.test.tsx  对真实运行 API 的 Vitest 验收
+  src/test/App.real.test.tsx  对真实运行 API 的 Vitest 验收（含标定全流程）
 Dockerfile.verify          验收镜像（Python 3.12 + Node 20）
 docker-compose.yml         web / api / verify（一次性）
 scripts/verify.sh          验收编排

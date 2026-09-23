@@ -8,6 +8,23 @@ const okDraft: FormDraft = {
     { x: "100", y: "0" },
   ],
   circles: [{ x: "50", y: "30", radius: "10" }],
+  calibrationEnabled: false,
+  maxRmsError: "1",
+  calibrationPairs: [
+    { surveyX: "", surveyY: "", pathX: "", pathY: "" },
+    { surveyX: "", surveyY: "", pathX: "", pathY: "" },
+  ],
+};
+
+/** 启用标定的合法草稿：纯平移 survey = path + (1000, 2000)。 */
+const calibratedDraft: FormDraft = {
+  ...okDraft,
+  calibrationEnabled: true,
+  calibrationPairs: [
+    { surveyX: "1000", surveyY: "2000", pathX: "0", pathY: "0" },
+    { surveyX: "1100", surveyY: "2000", pathX: "100", pathY: "0" },
+    { surveyX: "1000", surveyY: "2100", pathX: "0", pathY: "100" },
+  ],
 };
 
 describe("录入校验 validateDraft（与后端字段键一致）", () => {
@@ -72,10 +89,100 @@ describe("录入校验 validateDraft（与后端字段键一致）", () => {
       cableRadius: "-1",
       nodes: [{ x: "x", y: "0" }],
       circles: [{ x: "1", y: "2", radius: "NaN" }],
+      calibrationEnabled: false,
+      maxRmsError: "1",
+      calibrationPairs: [],
     };
     const errors = validateDraft(d);
     expect(Object.keys(errors).sort()).toEqual(
       ["cable_radius", "circles[0].radius", "nodes", "nodes[0].x"].sort(),
     );
+  });
+});
+
+describe("现场标定校验（字段键与后端 calibration.* 一致）", () => {
+  it("未启用标定：不校验控制点，载荷省略 calibration 键", () => {
+    const d: FormDraft = {
+      ...okDraft,
+      calibrationPairs: [{ surveyX: "abc", surveyY: "", pathX: "", pathY: "" }],
+    };
+    expect(validateDraft(d)).toEqual({});
+    expect("calibration" in buildPayload(d)).toBe(false);
+  });
+
+  it("合法标定：载荷带 calibration，坐标解析为数值", () => {
+    expect(validateDraft(calibratedDraft)).toEqual({});
+    expect(buildPayload(calibratedDraft).calibration).toEqual({
+      survey_points: [
+        { x: 1000, y: 2000 },
+        { x: 1100, y: 2000 },
+        { x: 1000, y: 2100 },
+      ],
+      path_points: [
+        { x: 0, y: 0 },
+        { x: 100, y: 0 },
+        { x: 0, y: 100 },
+      ],
+      max_rms_error: 1,
+    });
+  });
+
+  it("控制点对数需 2～20 对", () => {
+    const one: FormDraft = {
+      ...calibratedDraft,
+      calibrationPairs: [calibratedDraft.calibrationPairs[0]],
+    };
+    expect(validateDraft(one).calibration).toContain("2～20 对");
+    const many: FormDraft = {
+      ...calibratedDraft,
+      calibrationPairs: Array.from({ length: 21 }, (_, i) => ({
+        surveyX: String(i),
+        surveyY: "0",
+        pathX: String(i),
+        pathY: "0",
+      })),
+    };
+    expect(validateDraft(many).calibration).toContain("2～20 对");
+  });
+
+  it("非有限控制点坐标挂在对应字段键", () => {
+    const d: FormDraft = {
+      ...calibratedDraft,
+      calibrationPairs: [
+        { surveyX: "NaN", surveyY: "0", pathX: "0", pathY: "0" },
+        { surveyX: "1", surveyY: "Infinity", pathX: "1", pathY: "0" },
+        { surveyX: "0", surveyY: "1", pathX: "", pathY: "1" },
+      ],
+    };
+    const errors = validateDraft(d);
+    expect(errors["calibration.survey_points[0].x"]).toBeTruthy();
+    expect(errors["calibration.survey_points[1].y"]).toBeTruthy();
+    expect(errors["calibration.path_points[2].x"]).toBeTruthy();
+  });
+
+  it("任一组控制点全部重合即退化", () => {
+    const surveyDeg: FormDraft = {
+      ...calibratedDraft,
+      calibrationPairs: [
+        { surveyX: "5", surveyY: "5", pathX: "0", pathY: "0" },
+        { surveyX: "5", surveyY: "5", pathX: "1", pathY: "0" },
+      ],
+    };
+    expect(validateDraft(surveyDeg)["calibration.survey_points"]).toContain("重合");
+    const pathDeg: FormDraft = {
+      ...calibratedDraft,
+      calibrationPairs: [
+        { surveyX: "0", surveyY: "0", pathX: "2", pathY: "2" },
+        { surveyX: "1", surveyY: "0", pathX: "2", pathY: "2" },
+      ],
+    };
+    expect(validateDraft(pathDeg)["calibration.path_points"]).toContain("重合");
+  });
+
+  it("残差阈值必须为有限正数", () => {
+    for (const bad of ["0", "-1", "NaN", "Infinity", ""]) {
+      const d: FormDraft = { ...calibratedDraft, maxRmsError: bad };
+      expect(validateDraft(d)["calibration.max_rms_error"], `bad=${bad}`).toBeTruthy();
+    }
   });
 });

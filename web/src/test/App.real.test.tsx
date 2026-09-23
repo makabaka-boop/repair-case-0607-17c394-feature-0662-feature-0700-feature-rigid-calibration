@@ -365,8 +365,7 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     expect(m1?.tagName.toLowerCase()).toBe("circle");
   });
 
-  it("在途请求期间重置：慢响应返回后旧区间不恢复", async () => {
-    // 直接用 fetch 桩：让真实客户端请求挂起，重置后再放行
+  it("在途请求期间重置：慢响应返回后旧区间不恢复", async () => {    // 直接用 fetch 桩：让真实客户端请求挂起，重置后再放行
     let release: (() => void) | null = null;
     const realFetch = window.fetch.bind(window) as typeof window.fetch;
     const slowFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -392,6 +391,216 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByTestId("interval-panel")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-collision")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  // ---------- 现场标定（calibration）----------
+
+  /** 录入一对控制点（必要时先扩充行）。 */
+  async function fillPair(
+    i: number,
+    surveyX: string,
+    surveyY: string,
+    pathX: string,
+    pathY: string,
+  ) {
+    const type = async (testid: string, v: string) => {
+      const el = screen.getByTestId(testid);
+      await userEvent.clear(el);
+      await userEvent.type(el, v);
+    };
+    await type(`pair-${i}-survey-x`, surveyX);
+    await type(`pair-${i}-survey-y`, surveyY);
+    await type(`pair-${i}-path-x`, pathX);
+    await type(`pair-${i}-path-y`, pathY);
+  }
+
+  it("标定（纯平移）：变换摘要展示且相切结论 / SVG 高亮与后端同源", async () => {
+    render(<App />);
+    // 默认路径 (-100,0)->(100,0)、电缆 5、孔半径 10；
+    // survey = path + (1000,2000)，孔心 (1000,2015) → 施工坐标 (0,15) 相切
+    await userEvent.click(screen.getByTestId("calibration-enabled"));
+    await userEvent.click(screen.getByTestId("add-pair")); // 第三对
+    await fillPair(0, "1000", "2000", "0", "0");
+    await fillPair(1, "1100", "2000", "100", "0");
+    await fillPair(2, "1000", "2100", "0", "100");
+    await userEvent.clear(screen.getByTestId("circle-0-x"));
+    await userEvent.type(screen.getByTestId("circle-0-x"), "1000");
+    await userEvent.clear(screen.getByTestId("circle-0-y"));
+    await userEvent.type(screen.getByTestId("circle-0-y"), "2015");
+
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    // 变换摘要：恒等旋转、平移 (-1000,-2000)、残差 0
+    const panel = screen.getByTestId("calibration-panel");
+    expect(panel).toBeInTheDocument();
+    expect(screen.getByTestId("calibration-rms").textContent).toContain("0");
+    expect(screen.getByTestId("calibration-rotation").textContent).toContain(
+      "[[1, 0], [0, 1]]",
+    );
+    expect(screen.getByTestId("calibration-translation").textContent).toContain(
+      "(-1000, -2000)",
+    );
+    // 相切结论与 SVG 高亮同源（同一未舍入批次的三位展示）
+    const detail = screen.getByTestId("first-collision-detail").textContent ?? "";
+    expect(detail).toContain("(0, 0)");
+    expect(detail).toContain("15");
+    expect(document.querySelector('[data-testid="intrusion-c0-s0"]')).toBeInTheDocument();
+    expect(screen.getByTestId("first-collision-marker")).toBeInTheDocument();
+  });
+
+  it("标定（九十度旋转）：复合侵入段与 SVG 高亮和直接坐标场景一致", async () => {
+    render(<App />);
+    // 路径 0->100，电缆 1；survey 经 R90(x,y)=(-y,x) 即施工坐标。
+    // 孔 (0,-20)/(0,-30) r9 → 施工坐标 (20,0)/(30,0)，扩张 10 → 复合段 [20,30]
+    await userEvent.clear(screen.getByTestId("cable-radius"));
+    await userEvent.type(screen.getByTestId("cable-radius"), "1");
+    await userEvent.clear(screen.getByTestId("node-0-x"));
+    await userEvent.type(screen.getByTestId("node-0-x"), "0");
+    await userEvent.clear(screen.getByTestId("node-1-x"));
+    await userEvent.type(screen.getByTestId("node-1-x"), "100");
+
+    await userEvent.click(screen.getByTestId("calibration-enabled"));
+    await userEvent.click(screen.getByTestId("add-pair"));
+    await fillPair(0, "0", "0", "0", "0");
+    await fillPair(1, "100", "0", "0", "100");
+    await fillPair(2, "0", "100", "-100", "0");
+
+    await userEvent.clear(screen.getByTestId("circle-0-x"));
+    await userEvent.type(screen.getByTestId("circle-0-x"), "0");
+    await userEvent.clear(screen.getByTestId("circle-0-y"));
+    await userEvent.type(screen.getByTestId("circle-0-y"), "-20");
+    await userEvent.clear(screen.getByTestId("circle-0-radius"));
+    await userEvent.type(screen.getByTestId("circle-0-radius"), "9");
+    await userEvent.click(screen.getByTestId("add-circle"));
+    await userEvent.clear(screen.getByTestId("circle-1-x"));
+    await userEvent.type(screen.getByTestId("circle-1-x"), "0");
+    await userEvent.clear(screen.getByTestId("circle-1-y"));
+    await userEvent.type(screen.getByTestId("circle-1-y"), "-30");
+    await userEvent.clear(screen.getByTestId("circle-1-radius"));
+    await userEvent.type(screen.getByTestId("circle-1-radius"), "9");
+
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("compound-panel")).toBeInTheDocument(),
+    );
+    // 旋转摘要为九十度真旋转
+    expect(screen.getByTestId("calibration-rotation").textContent).toContain(
+      "[[0, -1], [1, 0]]",
+    );
+    const panel = screen.getByTestId("compound-list");
+    const rows = within(panel).getAllByRole("listitem").filter(
+      (li) => li.parentElement === panel,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].textContent).toContain("复合侵入 10 mm");
+    const mileage = within(rows[0]).getByTestId("compound-0-mileage").textContent ?? "";
+    expect(mileage).toContain("[20");
+    expect(mileage).toContain("30]");
+    // SVG 同一 compound_intrusion_segments 数组高亮
+    const mark = document.querySelector('[data-testid="compound-c0-1-s0"]');
+    expect(mark).toBeInTheDocument();
+    expect(mark?.tagName.toLowerCase()).toBe("path");
+  });
+
+  it("标定残差超阈值：422 字段错误，旧结论（含标定摘要）作废", async () => {
+    render(<App />);
+    // 先拿到一个旧结论
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    // 第三对偏差 50mm，阈值 1mm → 后端 422
+    await userEvent.click(screen.getByTestId("calibration-enabled"));
+    await userEvent.click(screen.getByTestId("add-pair"));
+    await fillPair(0, "1000", "2000", "0", "0");
+    await fillPair(1, "1100", "2000", "100", "0");
+    await fillPair(2, "1000", "2100", "0", "150");
+    await submit();
+
+    await waitFor(() => expect(screen.getByTestId("banner-error")).toBeInTheDocument());
+    expect(
+      screen.getByTestId("err-calibration.max_rms_error").textContent,
+    ).toContain("超过阈值");
+    // 旧结论全部清除：无场景、无碰撞横幅、无标定摘要
+    expect(screen.queryByTestId("scene")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-collision")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
+  });
+
+  it("控制点全部重合：本地校验失败不发请求，旧结论作废", async () => {
+    render(<App />);
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId("calibration-enabled"));
+    await fillPair(0, "5", "5", "0", "0");
+    await fillPair(1, "5", "5", "1", "0"); // survey 全部重合
+    await submit();
+
+    await waitFor(() => expect(screen.getByTestId("banner-error")).toBeInTheDocument());
+    expect(screen.getByTestId("err-calibration-points").textContent).toContain("重合");
+    expect(screen.queryByTestId("scene")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
+  });
+
+  it("重置使标定结论与录入一并作废", async () => {
+    render(<App />);
+    await userEvent.click(screen.getByTestId("calibration-enabled"));
+    await userEvent.click(screen.getByTestId("add-pair"));
+    await fillPair(0, "1000", "2000", "0", "0");
+    await fillPair(1, "1100", "2000", "100", "0");
+    await fillPair(2, "1000", "2100", "0", "100");
+    await userEvent.clear(screen.getByTestId("circle-0-x"));
+    await userEvent.type(screen.getByTestId("circle-0-x"), "1000");
+    await userEvent.clear(screen.getByTestId("circle-0-y"));
+    await userEvent.type(screen.getByTestId("circle-0-y"), "2015");
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("calibration-panel")).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId("reset"));
+    expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("scene")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-collision")).not.toBeInTheDocument();
+    // 标定录入恢复初始（未启用）
+    expect(
+      (screen.getByTestId("calibration-enabled") as HTMLInputElement).checked,
+    ).toBe(false);
+  });
+
+  it("请求失败（网络异常）使旧结论与标定摘要作废", async () => {
+    render(<App />);
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    const realFetch = window.fetch.bind(window) as typeof window.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/api/precheck")) {
+          throw new Error("网络不可达");
+        }
+        return realFetch(input as RequestInfo, init as RequestInit);
+      }),
+    );
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("network-error")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("scene")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-collision")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });
 });

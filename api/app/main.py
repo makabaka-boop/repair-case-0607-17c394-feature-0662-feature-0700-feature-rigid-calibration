@@ -1,16 +1,18 @@
-"""FastAPI 应用：隧道电缆绕孔预检。"""
+"""FastAPI 应用：隧道电缆绕孔预检（可选全站仪 → 施工坐标现场标定）。"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from .calibration import fit_rigid_transform
 from .geometry import Collision, CompoundIntrusionSegment, IntrusionInterval, analyze_path_full
 from .schemas import (
+    CalibrationOut,
     CircleOut,
     CollisionOut,
     CompoundIntrusionSegmentOut,
@@ -61,6 +63,8 @@ _MESSAGES = {
     "string_type": "必须是数值，不能是字符串",
     "int_from_float": "坐标必须是整数毫米",
     "bool_type": "不能是布尔值",
+    "too_short": "列表项数量不足",
+    "too_long": "列表项数量过多",
 }
 
 
@@ -94,6 +98,44 @@ def health() -> Dict[str, str]:
 def precheck(payload: PrecheckRequest) -> PrecheckResponse:
     nodes = [(n.x, n.y) for n in payload.nodes]
     circles = [((c.x, c.y), c.radius) for c in payload.circles]
+
+    # 可选现场标定：先以未舍入双精度拟合 survey → path 刚体变换，
+    # 残差超阈值直接 422（不生成任何碰撞/侵入/复合侵入结论）；
+    # 通过后只变换禁入圈圆心，半径、电缆路径与电缆半径语义不变，
+    # 后续粗筛与精确几何链路完全复用，排序/区间拓扑/三位展示同源。
+    calibration_view: Optional[CalibrationOut] = None
+    if payload.calibration is not None:
+        survey = [(p.x, p.y) for p in payload.calibration.survey_points]
+        path = [(p.x, p.y) for p in payload.calibration.path_points]
+        transform = fit_rigid_transform(survey, path)
+        if transform.rms_error > payload.calibration.max_rms_error:
+            raise RequestValidationError(
+                errors=[
+                    {
+                        "loc": ("body", "calibration", "max_rms_error"),
+                        "msg": (
+                            "Value error, 标定残差 RMS "
+                            f"{transform.rms_error:.6g} mm 超过阈值 "
+                            f"{payload.calibration.max_rms_error:.6g} mm"
+                        ),
+                        "type": "value_error",
+                    }
+                ]
+            )
+        circles = [(transform.apply(center), r) for (center, r) in circles]
+        (r00, r01), (r10, r11) = transform.rotation
+        calibration_view = CalibrationOut(
+            point_count=transform.point_count,
+            rotation=[
+                [round3(r00), round3(r01)],
+                [round3(r10), round3(r11)],
+            ],
+            translation=PointOut(
+                x=round3(transform.translation[0]),
+                y=round3(transform.translation[1]),
+            ),
+            rms_error=round3(transform.rms_error),
+        )
 
     raw: List[Collision]
     intervals: List[IntrusionInterval]
@@ -192,4 +234,5 @@ def precheck(payload: PrecheckRequest) -> PrecheckResponse:
         collisions=collisions,
         intrusion_intervals=interval_views,
         compound_intrusion_segments=compound_views,
+        calibration=calibration_view,
     )

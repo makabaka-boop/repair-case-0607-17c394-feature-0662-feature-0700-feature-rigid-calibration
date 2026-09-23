@@ -2,12 +2,16 @@
 
 所有非法情形都产生携带字段定位的错误，交由异常处理器转为 422：
 非有限数值、节点不足、非正半径、相邻重复节点、非整数毫米坐标、布尔值等。
+
+可选 `calibration`（现场控制点标定）：2～20 对 survey（全站仪）/ path
+（施工局部）控制点与正数 max_rms_error；两组等长、坐标有限且各自不能
+全部重合。省略时请求/响应与旧版逐项兼容。
 """
 
 from __future__ import annotations
 
 import math
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 
 from pydantic import (
     BaseModel,
@@ -61,6 +65,39 @@ PositiveRadius = Annotated[
 ]
 
 
+def _finite_number(v):
+    """有限数值：接受有限的 int/float，拒绝布尔、NaN、Infinity 与字符串。"""
+    if isinstance(v, bool):
+        raise ValueError("必须是有限数值，不能是布尔值")
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError("必须是有限数值（不能是 NaN 或无穷）")
+        return f
+    # 字符串等类型：交给 StrictFloat/StrictInt 核心报类型错误。
+    return v
+
+
+def _positive_number(v):
+    """正数阈值：接受有限的 int/float，拒绝布尔、NaN、Infinity 与非正数值。"""
+    if isinstance(v, bool):
+        raise ValueError("必须是正数，不能是布尔值")
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError("必须是有限正数（不能是 NaN 或无穷）")
+        if f <= 0:
+            raise ValueError("必须是正数")
+        return f
+    return v
+
+
+# 控制点坐标：有限数值（全站仪坐标可以带小数，不限整数毫米）。
+FiniteNumber = Annotated[StrictFloat | StrictInt, BeforeValidator(_finite_number)]
+# 正数阈值（max_rms_error）。
+PositiveNumber = Annotated[StrictFloat | StrictInt, BeforeValidator(_positive_number)]
+
+
 class StrictPointIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,12 +113,66 @@ class StrictCircleIn(BaseModel):
     radius: PositiveRadius
 
 
+def _all_coincident(points: List["CalibrationPointIn"]) -> bool:
+    """控制点是否全部重合（退化构型无法确定刚体变换）。"""
+    first = points[0]
+    return all(p.x == first.x and p.y == first.y for p in points)
+
+
+class CalibrationPointIn(BaseModel):
+    """单个控制点：有限数值坐标（全站仪/施工坐标均可带小数）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: FiniteNumber
+    y: FiniteNumber
+
+
+class CalibrationIn(BaseModel):
+    """可选现场标定：survey（全站仪）→ path（施工局部）控制点对。
+
+    2～20 对、两组等长、坐标有限且各自不能全部重合；max_rms_error
+    为正数阈值，拟合残差超过它时整次请求以 422 拒绝（不产生任何结论）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    survey_points: Annotated[
+        List[CalibrationPointIn], Field(min_length=2, max_length=20)
+    ]
+    path_points: Annotated[
+        List[CalibrationPointIn], Field(min_length=2, max_length=20)
+    ]
+    max_rms_error: PositiveNumber
+
+    @field_validator("survey_points")
+    @classmethod
+    def _survey_not_all_coincident(cls, points: List[CalibrationPointIn]):
+        if _all_coincident(points):
+            raise ValueError("survey_points 全部重合，无法确定刚体变换")
+        return points
+
+    @field_validator("path_points")
+    @classmethod
+    def _path_matches_survey(cls, points: List[CalibrationPointIn], info):
+        survey = info.data.get("survey_points")
+        if survey is not None and len(points) != len(survey):
+            raise ValueError(
+                f"survey_points 与 path_points 必须等长（{len(survey)} ≠ {len(points)}）"
+            )
+        if _all_coincident(points):
+            raise ValueError("path_points 全部重合，无法确定刚体变换")
+        return points
+
+
 class PrecheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nodes: Annotated[List[StrictPointIn], Field(min_length=2)]
     cable_radius: PositiveRadius
     circles: List[StrictCircleIn]
+    # 可选现场标定；省略时行为与旧版完全一致。
+    calibration: Optional[CalibrationIn] = None
 
     @field_validator("nodes")
     @classmethod
@@ -171,6 +262,15 @@ class CompoundIntrusionSegmentOut(BaseModel):
     pieces: List[CompoundPieceOut]   # 按原线段切分的片段，供 SVG 高亮
 
 
+class CalibrationOut(BaseModel):
+    """标定结果摘要（展示值，三位小数；变换本身以未舍入双精度应用）。"""
+
+    point_count: int             # 控制点对数
+    rotation: List[List[float]]  # 2x2 行主序真旋转矩阵（det = +1）
+    translation: PointOut        # 平移向量
+    rms_error: float             # 控制点残差均方根（毫米）
+
+
 class PrecheckResponse(BaseModel):
     feasible: bool
     cable_radius: float      # 展示用（三位小数）
@@ -183,3 +283,5 @@ class PrecheckResponse(BaseModel):
     compound_intrusion_segments: List[CompoundIntrusionSegmentOut] = Field(
         default_factory=list
     )
+    # 请求带 calibration 时给出标定摘要；省略时为 null（旧字段逐项兼容）。
+    calibration: Optional[CalibrationOut] = None
