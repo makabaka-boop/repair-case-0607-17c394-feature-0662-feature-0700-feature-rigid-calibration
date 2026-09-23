@@ -64,6 +64,23 @@ export interface CompoundIntrusionSegment {
   pieces: CompoundPiece[];
 }
 
+export type RotationMatrix = [[number, number], [number, number]];
+
+export interface CalibrationPointResidual {
+  index: number;
+  survey_point: Point;
+  path_point: Point;
+  residual: number;
+}
+
+export interface CalibrationResult {
+  rotation: RotationMatrix;
+  translation: Point;
+  rms_error: number;
+  max_rms_error: number;
+  point_residuals: CalibrationPointResidual[];
+}
+
 export interface PrecheckResponse {
   feasible: boolean;
   cable_radius: number;
@@ -74,12 +91,20 @@ export interface PrecheckResponse {
   collisions: Collision[];
   intrusion_intervals: IntrusionInterval[];
   compound_intrusion_segments: CompoundIntrusionSegment[];
+  calibration?: CalibrationResult;
+}
+
+export interface CalibrationPayload {
+  survey_points: Point[];
+  path_points: Point[];
+  max_rms_error: number;
 }
 
 export interface PrecheckPayload {
   nodes: Point[];
   cable_radius: number;
   circles: Array<Point & { radius: number }>;
+  calibration?: CalibrationPayload;
 }
 
 export type FieldErrors = Record<string, string>;

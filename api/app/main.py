@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from .calibration import CalibrationError, RigidTransform2D, fit_rigid_transform_2d
 from .geometry import Collision, CompoundIntrusionSegment, IntrusionInterval, analyze_path_full
 from .schemas import (
+    CalibrationOut,
+    CalibrationPointResidualOut,
     CircleOut,
     CollisionOut,
     CompoundIntrusionSegmentOut,
@@ -67,6 +70,10 @@ _MESSAGES = {
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """转换为统一的字段级错误结构。任何校验失败都不产生预检结论。"""
+    return JSONResponse(status_code=422, content={"ok": False, "errors": _format_errors(exc)})
+
+
+def _format_errors(exc: RequestValidationError) -> Dict[str, str]:
     errors: Dict[str, str] = {}
     for err in exc.errors():
         field = _loc_to_field(tuple(err.get("loc", ())))
@@ -79,10 +86,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         else:
             text = msg
         errors.setdefault(field, text)
-    return JSONResponse(
-        status_code=422,
-        content={"ok": False, "errors": errors},
-    )
+    return errors
 
 
 @app.get("/api/health")
@@ -90,10 +94,38 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+def _calibration_error_response(exc: CalibrationError) -> JSONResponse:
+    field = _loc_to_field(("body", "calibration", *exc.loc))
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "errors": {field: str(exc)}},
+    )
+
+
 @app.post("/api/precheck", response_model=PrecheckResponse)
-def precheck(payload: PrecheckRequest) -> PrecheckResponse:
+def precheck(payload: PrecheckRequest) -> PrecheckResponse | JSONResponse:
     nodes = [(n.x, n.y) for n in payload.nodes]
-    circles = [((c.x, c.y), c.radius) for c in payload.circles]
+    calibration: RigidTransform2D | None = None
+    if payload.calibration is not None:
+        survey_points = [(p.x, p.y) for p in payload.calibration.survey_points]
+        path_points = [(p.x, p.y) for p in payload.calibration.path_points]
+        try:
+            calibration = fit_rigid_transform_2d(
+                survey_points=survey_points,
+                path_points=path_points,
+                max_rms_error=payload.calibration.max_rms_error,
+            )
+        except CalibrationError as exc:
+            return _calibration_error_response(exc)
+
+    # 仅变换禁入圈圆心；半径、电缆路径与电缆半径维持既有语义。
+    circles = [
+        (
+            (c.x, c.y) if calibration is None else calibration.apply((c.x, c.y)),
+            c.radius,
+        )
+        for c in payload.circles
+    ]
 
     raw: List[Collision]
     intervals: List[IntrusionInterval]
@@ -182,7 +214,30 @@ def precheck(payload: PrecheckRequest) -> PrecheckResponse:
         for seg in compounds
     ]
 
-    return PrecheckResponse(
+    calibration_view: CalibrationOut | None = None
+    if payload.calibration is not None and calibration is not None:
+        survey_points = [(p.x, p.y) for p in payload.calibration.survey_points]
+        path_points = [(p.x, p.y) for p in payload.calibration.path_points]
+        calibration_view = CalibrationOut(
+            rotation=calibration.rotation,
+            translation=PointOut(
+                x=calibration.translation[0],
+                y=calibration.translation[1],
+            ),
+            rms_error=calibration.rms_error,
+            max_rms_error=payload.calibration.max_rms_error,
+            point_residuals=[
+                CalibrationPointResidualOut(
+                    index=i,
+                    survey_point=PointOut(x=survey_points[i][0], y=survey_points[i][1]),
+                    path_point=PointOut(x=path_points[i][0], y=path_points[i][1]),
+                    residual=calibration.residuals[i],
+                )
+                for i in range(len(survey_points))
+            ],
+        )
+
+    response = PrecheckResponse(
         feasible=len(collisions) == 0,
         cable_radius=round3(payload.cable_radius),
         nodes=[PointOut(x=round3(x), y=round3(y)) for (x, y) in nodes],
@@ -192,4 +247,9 @@ def precheck(payload: PrecheckRequest) -> PrecheckResponse:
         collisions=collisions,
         intrusion_intervals=interval_views,
         compound_intrusion_segments=compound_views,
+        calibration=calibration_view,
     )
+    # 省略 calibration 时响应字段也完全省略，保持旧请求/旧客户端逐项兼容。
+    if calibration_view is None:
+        return JSONResponse(response.model_dump(exclude={"calibration"}))
+    return JSONResponse(response.model_dump())

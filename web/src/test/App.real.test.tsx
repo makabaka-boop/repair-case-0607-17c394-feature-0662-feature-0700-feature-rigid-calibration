@@ -20,6 +20,27 @@ async function submit() {
   await userEvent.click(screen.getByTestId("submit"));
 }
 
+async function setInput(testid: string, value: string) {
+  const input = screen.getByTestId(testid);
+  await userEvent.clear(input);
+  await userEvent.type(input, value);
+}
+
+async function enableCalibration(pairs: Array<[string, string, string, string]>, maxRms = "0.01") {
+  await userEvent.click(screen.getByTestId("calibration-enabled"));
+  await setInput("calibration-max-rms", maxRms);
+  while (screen.queryAllByTestId(/^calibration-survey-/).length / 2 < pairs.length) {
+    await userEvent.click(screen.getByTestId("add-calibration-pair"));
+  }
+  for (let i = 0; i < pairs.length; i += 1) {
+    const [sx, sy, px, py] = pairs[i];
+    await setInput(`calibration-survey-${i}-x`, sx);
+    await setInput(`calibration-survey-${i}-y`, sy);
+    await setInput(`calibration-path-${i}-x`, px);
+    await setInput(`calibration-path-${i}-y`, py);
+  }
+}
+
 describe("真实请求 + 录入 + 高亮（App）", () => {
   it("录入节点/禁入圈顺序并真实请求：相切场景判定不可敷设且突出首个碰撞", async () => {
     render(<App />);
@@ -292,8 +313,8 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     expect(mileage).toContain("[20");
     expect(mileage).toContain("30]");
     const endpoints = within(row).getByTestId("compound-0-endpoints").textContent ?? "";
-    expect(endpoints).toContain("[(20, 0)");
-    expect(endpoints).toContain("(30, 0)]");
+    expect(endpoints).toContain("[(20.000, 0.000)");
+    expect(endpoints).toContain("(30.000, 0.000)]");
     // pieces 按原线段切分（单段），与 SVG 同源数组
     const pieces = within(row).getAllByTestId(/compound-0-piece-/);
     expect(pieces.length).toBe(1);
@@ -363,6 +384,101 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     const m1 = document.querySelector('[data-testid="compound-c0-1-s1"]');
     expect(m0?.tagName.toLowerCase()).toBe("circle");
     expect(m1?.tagName.toLowerCase()).toBe("circle");
+  });
+
+  it("标定纯平移：只变换孔圆心，相切结果、摘要与 SVG 高亮同源", async () => {
+    render(<App />);
+    await setInput("node-0-x", "0");
+    await setInput("node-1-x", "100");
+    await setInput("circle-0-x", "1050");
+    await setInput("circle-0-y", "1995");
+    await setInput("circle-0-radius", "10");
+    await enableCalibration([
+      ["1000", "2000", "10", "20"],
+      ["1001", "2000", "11", "20"],
+      ["1000", "2001", "10", "21"],
+    ]);
+
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("calibration-summary").textContent).toContain(
+      "平移：(-990.000, -1980.000)",
+    );
+    expect(screen.getByTestId("calibration-rms").textContent).toContain("0.000 / ≤ 0.010");
+    expect(screen.getByTestId("calibration-angle").textContent).toContain("0.000°");
+    const detail = screen.getByTestId("first-collision-detail").textContent ?? "";
+    expect(detail).toContain("(60, 0)");
+    // 圆心已在后端变换为局部 (60,15)，SVG 与详情共用同一响应。
+    expect(document.querySelector('[data-testid="forbidden-circle-0"]')).toHaveAttribute(
+      "cx",
+      expect.any(String),
+    );
+    expect(document.querySelector('[data-testid="intrusion-c0-s0"]')).toBeInTheDocument();
+  });
+
+  it("标定 90° 旋转：复合侵入按变换后的同一批几何结果在 SVG 高亮", async () => {
+    render(<App />);
+    await setInput("cable-radius", "1");
+    await setInput("node-0-x", "0");
+    await setInput("node-1-x", "100");
+    await userEvent.click(screen.getByTestId("add-node"));
+    await setInput("node-2-x", "100");
+    await setInput("node-2-y", "100");
+    // 局部圈 A/B 为 (20,0)/(30,0)；survey = 局部顺时针90 +(1000,2000)：
+    // (x,y)->(1000-y,2000+x)，标定回局部为逆时针 90°。
+    await setInput("circle-0-x", "1000");
+    await setInput("circle-0-y", "2020");
+    await setInput("circle-0-radius", "9");
+    await userEvent.click(screen.getByTestId("add-circle"));
+    await setInput("circle-1-x", "1000");
+    await setInput("circle-1-y", "2030");
+    await setInput("circle-1-radius", "9");
+    await enableCalibration(
+      [
+        ["1000", "2000", "0", "0"],
+        ["1000", "2010", "10", "0"],
+        ["990", "2000", "0", "10"],
+        ["990", "2010", "10", "10"],
+      ],
+      "0.001",
+    );
+
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("compound-panel")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("calibration-angle").textContent).toContain("90.000°");
+    const endpoints = within(screen.getByTestId("compound-0")).getByTestId(
+      "compound-0-endpoints",
+    ).textContent ?? "";
+    expect(endpoints).toContain("(20.000, 0.000)");
+    expect(endpoints).toContain("(30.000, 0.000)");
+    expect(document.querySelector('[data-testid="compound-c0-1-s0"]')).toBeInTheDocument();
+  });
+
+  it("标定残差超阈值：服务端 422 清除旧结论并显示明确定位", async () => {
+    render(<App />);
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+    await enableCalibration(
+      [
+        ["0", "0", "0", "0"],
+        ["10", "0", "9", "0"],
+        ["10", "10", "10", "10"],
+      ],
+      "0.001",
+    );
+    await submit();
+    await waitFor(() => expect(screen.getByTestId("banner-error")).toBeInTheDocument());
+    expect(screen.getByTestId("err-calibration.max_rms_error").textContent).toContain(
+      "超过允许上限",
+    );
+    expect(screen.queryByTestId("banner-collision")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("scene")).not.toBeInTheDocument();
   });
 
   it("在途请求期间重置：慢响应返回后旧区间不恢复", async () => {

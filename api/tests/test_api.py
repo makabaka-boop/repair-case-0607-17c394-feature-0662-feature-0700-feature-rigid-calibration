@@ -2,6 +2,7 @@
 
 import math
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -241,7 +242,235 @@ def test_error_wrong_type_string():
     assert_field_error(body, "nodes[0].x")
 
 
+
+
+# ---------- 可选坐标标定：survey 圆心 -> path 局部坐标 ----------
+
+
 def test_error_unknown_field_rejected():
     body = base_body()
     body["nope"] = 1
     assert_field_error(body, "nope")
+
+
+def calibration_body(**calibration_over):
+    calibration = {
+        "survey_points": [
+            {"x": 1000.0, "y": 2000.0},
+            {"x": 1001.0, "y": 2000.0},
+            {"x": 1000.0, "y": 2001.0},
+        ],
+        "path_points": [
+            {"x": 10.0, "y": 20.0},
+            {"x": 11.0, "y": 20.0},
+            {"x": 10.0, "y": 21.0},
+        ],
+        "max_rms_error": 0.01,
+    }
+    calibration.update(calibration_over)
+    return calibration
+
+
+def test_request_without_calibration_omits_calibration_response_field():
+    r = post(base_body())
+    assert r.status_code == 200
+    data = r.json()
+    assert "calibration" not in data
+
+
+def test_calibration_pure_translation_moves_only_circle_centers_for_tangent():
+    body = base_body(
+        nodes=[{"x": 0, "y": 0}, {"x": 100, "y": 0}],
+        cable_radius=5,
+        circles=[{"x": 1050, "y": 1995, "radius": 10}],
+        calibration=calibration_body(),
+    )
+    r = post(body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["feasible"] is False
+    assert data["circles"][0]["center"] == {"x": 60.0, "y": 15.0}
+    assert data["circles"][0]["radius"] == 10.0
+    assert data["circles"][0]["expanded_radius"] == 15.0
+    collision = data["collisions"][0]
+    assert collision["circle_center"] == {"x": 60.0, "y": 15.0}
+    assert collision["nearest"] == {"x": 60.0, "y": 0.0}
+    assert collision["distance"] == 15.0
+
+    calibration = data["calibration"]
+    assert calibration["rotation"] == [[1.0, 0.0], [0.0, 1.0]]
+    assert calibration["translation"] == {"x": -990.0, "y": -1980.0}
+    assert calibration["rms_error"] == pytest.approx(0.0, abs=1e-12)
+    assert calibration["max_rms_error"] == 0.01
+    assert len(calibration["point_residuals"]) == 3
+
+
+def test_calibrated_geometry_keeps_path_nodes_and_cable_radius_semantics():
+    # survey 中心 (1050,2015) 变换到局部 (60,35)，距路径 35；不碰撞。
+    body = base_body(
+        nodes=[{"x": 0, "y": 0}, {"x": 100, "y": 0}],
+        cable_radius=5,
+        circles=[{"x": 1050, "y": 2015, "radius": 10}],
+        calibration=calibration_body(),
+    )
+    data = post(body).json()
+    assert data["feasible"] is True
+    assert data["nodes"] == [{"x": 0.0, "y": 0.0}, {"x": 100.0, "y": 0.0}]
+    assert data["cable_radius"] == 5.0
+    assert data["circles"][0]["radius"] == 10.0
+    assert data["circles"][0]["expanded_radius"] == 15.0
+
+    # survey Y 减 20 后变换到局部 (60,15)：半径 10 + 电缆 5 恰相切。
+    tangent_body = dict(body)
+    tangent_body["circles"] = [{"x": 1050, "y": 1995, "radius": 10}]
+    tangent = post(tangent_body).json()
+    assert tangent["feasible"] is False
+    assert tangent["circles"][0]["center"] == {"x": 60.0, "y": 15.0}
+    assert tangent["collisions"][0]["nearest"] == {"x": 60.0, "y": 0.0}
+    assert tangent["collisions"][0]["distance"] == 15.0
+
+
+def test_calibration_ninety_degree_rotation_and_transformed_compound_intrusion():
+    # 局部：路径 (0,0)->(100,0)->(100,100)；survey 由局部点顺时针 90° +
+    # 平移得到，因此反向标定为逆时针 90°。
+    local_points = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    survey_points = [{"x": 1000.0 - y, "y": 2000.0 + x} for x, y in local_points]
+    path_points = [{"x": x, "y": y} for x, y in local_points]
+
+    def survey_circle(local_x, local_y):
+        return {
+            "x": 1000 - local_y,
+            "y": 2000 + local_x,
+            "radius": 9,
+        }
+
+    body = {
+        "nodes": [{"x": 0, "y": 0}, {"x": 100, "y": 0}, {"x": 100, "y": 100}],
+        "cable_radius": 1,
+        "circles": [survey_circle(20, 0), survey_circle(30, 0)],
+        "calibration": {
+            "survey_points": survey_points,
+            "path_points": path_points,
+            "max_rms_error": 1e-9,
+        },
+    }
+    response = post(body)
+    data = response.json()
+    assert response.status_code == 200, data
+    rotation = data["calibration"]["rotation"]
+    assert rotation[0][0] == pytest.approx(0.0, abs=1e-12)
+    assert rotation[0][1] == pytest.approx(1.0, abs=1e-12)
+    assert rotation[1][0] == pytest.approx(-1.0, abs=1e-12)
+    assert rotation[1][1] == pytest.approx(0.0, abs=1e-12)
+    assert data["circles"][0]["center"] == {"x": 20.0, "y": 0.0}
+    assert data["circles"][1]["center"] == {"x": 30.0, "y": 0.0}
+    compounds = data["compound_intrusion_segments"]
+    assert len(compounds) == 1
+    assert compounds[0]["circle_indices"] == [0, 1]
+    assert compounds[0]["start"] == {"x": 20.0, "y": 0.0}
+    assert compounds[0]["end"] == {"x": 30.0, "y": 0.0}
+    assert compounds[0]["pieces"][0]["entry"] == {"x": 20.0, "y": 0.0}
+    assert compounds[0]["pieces"][0]["exit"] == {"x": 30.0, "y": 0.0}
+
+
+def test_calibration_residual_over_threshold_returns_422_and_no_results():
+    bad = calibration_body(
+        survey_points=[
+            {"x": 0.0, "y": 0.0},
+            {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0},
+        ],
+        path_points=[
+            {"x": 0.0, "y": 0.0},
+            {"x": 9.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0},
+        ],
+        max_rms_error=0.001,
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    data = r.json()
+    assert data["ok"] is False
+    assert "calibration.max_rms_error" in data["errors"]
+    assert "collisions" not in data and "compound_intrusion_segments" not in data
+
+
+def test_calibration_degenerate_survey_points_return_field_locator():
+    bad = calibration_body(
+        survey_points=[
+            {"x": 1.0, "y": 1.0},
+            {"x": 1.0, "y": 1.0},
+            {"x": 1.0, "y": 1.0},
+        ]
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.survey_points" in r.json()["errors"]
+
+
+def test_calibration_degenerate_path_points_return_field_locator():
+    bad = calibration_body(
+        path_points=[
+            {"x": 1.0, "y": 1.0},
+            {"x": 1.0, "y": 1.0},
+            {"x": 1.0, "y": 1.0},
+        ]
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.path_points" in r.json()["errors"]
+
+
+def test_calibration_non_collinear_mirror_returns_field_locator():
+    bad = calibration_body(
+        survey_points=[
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+            {"x": 0.0, "y": 1.0},
+        ],
+        path_points=[
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+            {"x": 0.0, "y": -1.0},
+        ],
+        max_rms_error=100.0,
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.survey_points" in r.json()["errors"]
+
+
+def test_calibration_unequal_point_arrays_return_path_points_locator():
+    bad = calibration_body(
+        path_points=[
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+        ]
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.path_points" in r.json()["errors"]
+
+
+def test_calibration_length_count_and_finiteness_errors_are_field_located():
+    bad = calibration_body(
+        survey_points=[{"x": 0.0, "y": 0.0}],
+        path_points=[{"x": 0.0, "y": 0.0}],
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.survey_points" in r.json()["errors"]
+
+    bad = calibration_body(max_rms_error=0)
+    assert "calibration.max_rms_error" in post(base_body(calibration=bad)).json()["errors"]
+
+    bad = calibration_body(
+        survey_points=[
+            {"x": "NaN", "y": 0.0},
+            {"x": 1.0, "y": 0.0},
+            {"x": 0.0, "y": 1.0},
+        ]
+    )
+    r = post(base_body(calibration=bad))
+    assert r.status_code == 422
+    assert "calibration.survey_points[0].x" in r.json()["errors"]

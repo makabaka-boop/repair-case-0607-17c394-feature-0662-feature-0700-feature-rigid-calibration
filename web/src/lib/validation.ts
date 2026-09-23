@@ -10,10 +10,19 @@ export interface CircleDraft {
   y: string;
   radius: string;
 }
+export interface CalibrationPairDraft {
+  surveyX: string;
+  surveyY: string;
+  pathX: string;
+  pathY: string;
+}
 export interface FormDraft {
   cableRadius: string;
   nodes: NodeDraft[];
   circles: CircleDraft[];
+  calibrationEnabled: boolean;
+  calibrationMaxRmsError: string;
+  calibrationPairs: CalibrationPairDraft[];
 }
 
 function parseFiniteInt(raw: string): number {
@@ -24,6 +33,16 @@ function parseFiniteInt(raw: string): number {
   }
   const n = Number(t);
   if (!Number.isSafeInteger(n)) throw new Error("整数超出安全范围");
+  return n;
+}
+
+function parseFiniteNumber(raw: string): number {
+  const t = raw.trim();
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(t)) {
+    throw new Error("必须是有限数值");
+  }
+  const n = Number(t);
+  if (!Number.isFinite(n)) throw new Error("必须是有限数值");
   return n;
 }
 
@@ -96,12 +115,83 @@ export function validateDraft(draft: FormDraft): FieldErrors {
     }
   });
 
+  if (draft.calibrationEnabled) {
+    try {
+      parsePositiveFinite(draft.calibrationMaxRmsError);
+    } catch (e) {
+      errors["calibration.max_rms_error"] = `残差上限${(e as Error).message}`;
+    }
+
+    const pairs = draft.calibrationPairs;
+    if (pairs.length < 2 || pairs.length > 20) {
+      errors["calibration.survey_points"] = "需要 2～20 对控制点";
+    }
+
+    const parsedSurvey: Array<{ x: number; y: number } | null> = [];
+    const parsedPath: Array<{ x: number; y: number } | null> = [];
+    pairs.forEach((pair, i) => {
+      const parsePairPoint = (
+        xRaw: string,
+        yRaw: string,
+        xKey: string,
+        yKey: string,
+        label: string,
+      ): { x: number; y: number } | null => {
+        let x: number | null = null;
+        let y: number | null = null;
+        try {
+          x = parseFiniteNumber(xRaw);
+        } catch (e) {
+          errors[xKey] = `${label} X ${(e as Error).message}`;
+        }
+        try {
+          y = parseFiniteNumber(yRaw);
+        } catch (e) {
+          errors[yKey] = `${label} Y ${(e as Error).message}`;
+        }
+        return x === null || y === null ? null : { x, y };
+      };
+
+      parsedSurvey.push(
+        parsePairPoint(
+          pair.surveyX,
+          pair.surveyY,
+          `calibration.survey_points[${i}].x`,
+          `calibration.survey_points[${i}].y`,
+          "全站仪点",
+        ),
+      );
+      parsedPath.push(
+        parsePairPoint(
+          pair.pathX,
+          pair.pathY,
+          `calibration.path_points[${i}].x`,
+          `calibration.path_points[${i}].y`,
+          "路径点",
+        ),
+      );
+    });
+
+    if (pairs.length >= 2) {
+      const validSurvey = parsedSurvey.filter((p): p is { x: number; y: number } => p !== null);
+      const validPath = parsedPath.filter((p): p is { x: number; y: number } => p !== null);
+      const allSame = (points: Array<{ x: number; y: number }>) =>
+        points.length > 0 && points.every((p) => p.x === points[0].x && p.y === points[0].y);
+      if (validSurvey.length === pairs.length && allSame(validSurvey)) {
+        errors["calibration.survey_points"] = "全站仪控制点不能全部重合";
+      }
+      if (validPath.length === pairs.length && allSame(validPath)) {
+        errors["calibration.path_points"] = "施工局部控制点不能全部重合";
+      }
+    }
+  }
+
   return errors;
 }
 
 /** 解析为后端载荷；调用前应已通过 validateDraft。 */
 export function buildPayload(draft: FormDraft) {
-  return {
+  const payload = {
     cable_radius: parsePositiveFinite(draft.cableRadius),
     nodes: draft.nodes.map((n) => ({
       x: parseFiniteInt(n.x),
@@ -112,5 +202,20 @@ export function buildPayload(draft: FormDraft) {
       y: parseFiniteInt(c.y),
       radius: parsePositiveFinite(c.radius),
     })),
+  };
+  if (!draft.calibrationEnabled) return payload;
+  return {
+    ...payload,
+    calibration: {
+      survey_points: draft.calibrationPairs.map((p) => ({
+        x: parseFiniteNumber(p.surveyX),
+        y: parseFiniteNumber(p.surveyY),
+      })),
+      path_points: draft.calibrationPairs.map((p) => ({
+        x: parseFiniteNumber(p.pathX),
+        y: parseFiniteNumber(p.pathY),
+      })),
+      max_rms_error: parsePositiveFinite(draft.calibrationMaxRmsError),
+    },
   };
 }

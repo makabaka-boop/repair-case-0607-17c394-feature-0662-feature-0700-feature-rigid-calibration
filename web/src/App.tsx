@@ -4,11 +4,13 @@ import { Scene } from "./components/Scene";
 import {
   buildPayload,
   validateDraft,
+  type CalibrationPairDraft,
   type CircleDraft,
   type FormDraft,
   type NodeDraft,
 } from "./lib/validation";
 import type {
+  CalibrationResult,
   CompoundIntrusionSegment,
   FieldErrors,
   IntrusionInterval,
@@ -45,9 +47,20 @@ const initialDraft: FormDraft = {
     { x: "100", y: "0" },
   ],
   circles: [{ x: "0", y: "15", radius: "10" }],
+  calibrationEnabled: false,
+  calibrationMaxRmsError: "1",
+  calibrationPairs: [
+    { surveyX: "", surveyY: "", pathX: "", pathY: "" },
+    { surveyX: "", surveyY: "", pathX: "", pathY: "" },
+  ],
 };
 
 const fmt = (n: number) => String(n);
+const fmt3 = (n: number) => n.toFixed(3);
+
+function rotationAngleDeg(calibration: CalibrationResult): number {
+  return (Math.atan2(calibration.rotation[1][0], calibration.rotation[0][0]) * 180) / Math.PI;
+}
 
 function IntervalRow({ iv, order }: { iv: IntrusionInterval; order: number }) {
   const sameSegment = iv.entry_segment_index === iv.exit_segment_index;
@@ -112,9 +125,9 @@ function CompoundRow({ seg, order }: { seg: CompoundIntrusionSegment; order: num
       <div className="interval-body">
         <p data-testid={`compound-${order}-endpoints`}>
           {sameSegment ? "线段" : "跨线段"} #{segIds.join(" → #")}：
-          {leftBracket(seg.start_inclusive)}({fmt(seg.start.x)}, {fmt(seg.start.y)})
+          {leftBracket(seg.start_inclusive)}({fmt3(seg.start.x)}, {fmt3(seg.start.y)})
           {" → "}
-          ({fmt(seg.end.x)}, {fmt(seg.end.y)}){rightBracket(seg.end_inclusive)}
+          ({fmt3(seg.end.x)}, {fmt3(seg.end.y)}){rightBracket(seg.end_inclusive)}
         </p>
         <p
           className="interval-mileage"
@@ -146,6 +159,36 @@ function CompoundRow({ seg, order }: { seg: CompoundIntrusionSegment; order: num
   );
 }
 
+function CalibrationSummary({ calibration }: { calibration: CalibrationResult }) {
+  const r = calibration.rotation;
+  return (
+    <div className="interval-panel calibration-summary" data-testid="calibration-summary">
+      <h2 className="interval-title">坐标标定摘要（survey → 施工局部）</h2>
+      <div className="calibration-grid">
+        <span data-testid="calibration-angle">旋转角：{fmt3(rotationAngleDeg(calibration))}°</span>
+        <span data-testid="calibration-translation">
+          平移：({fmt3(calibration.translation.x)}, {fmt3(calibration.translation.y)})
+        </span>
+        <span data-testid="calibration-rms">
+          残差 RMS：{fmt3(calibration.rms_error)} / ≤ {fmt3(calibration.max_rms_error)} mm
+        </span>
+      </div>
+      <div className="calibration-matrix" data-testid="calibration-matrix">
+        R = [[{fmt3(r[0][0])}, {fmt3(r[0][1])}], [{fmt3(r[1][0])}, {fmt3(r[1][1])}]]
+      </div>
+      <ol className="calibration-residuals" data-testid="calibration-residuals">
+        {calibration.point_residuals.map((p) => (
+          <li key={p.index} data-testid={`calibration-residual-${p.index}`}>
+            #{p.index}：全站仪 ({fmt3(p.survey_point.x)}, {fmt3(p.survey_point.y)}) →
+            局部 ({fmt3(p.path_point.x)}, {fmt3(p.path_point.y)})，残差{" "}
+            {fmt3(p.residual)} mm
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 export function App() {
   const [draft, setDraft] = useState<FormDraft>(initialDraft);
   const [result, setResult] = useState<PrecheckResponse | null>(null);
@@ -167,6 +210,22 @@ export function App() {
       ...d,
       circles: d.circles.map((c, idx) => (idx === i ? { ...c, ...patch } : c)),
     }));
+  };
+  const updateCalibrationPair = (i: number, patch: Partial<CalibrationPairDraft>) => {
+    setDraft((d) => ({
+      ...d,
+      calibrationPairs: d.calibrationPairs.map((p, idx) =>
+        idx === i ? { ...p, ...patch } : p,
+      ),
+    }));
+  };
+
+  const invalidateResult = () => {
+    requestSeq.current += 1;
+    setResult(null);
+    setErrors({});
+    setNetworkError(null);
+    setLoading(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -379,6 +438,137 @@ export function App() {
             </ol>
           </section>
 
+          <section>
+            <div className="row-head calibration-head">
+              <h2>全站仪坐标标定（可选；仅变换禁入圈圆心）</h2>
+              <label className="switch-label">
+                <input
+                  type="checkbox"
+                  checked={draft.calibrationEnabled}
+                  data-testid="calibration-enabled"
+                  onChange={(e) => {
+                    invalidateResult();
+                    setDraft((d) => ({ ...d, calibrationEnabled: e.target.checked }));
+                  }}
+                />
+                启用标定
+              </label>
+            </div>
+            {draft.calibrationEnabled && (
+              <div className="calibration-editor" data-testid="calibration-editor">
+                <div className="calibration-threshold">
+                  <label htmlFor="calibration-max-rms">最大允许 RMS（mm，正数）</label>
+                  <NumInput
+                    value={draft.calibrationMaxRmsError}
+                    testid="calibration-max-rms"
+                    ariaLabel="标定最大允许 RMS"
+                    invalid={hasErr(errors, "calibration.max_rms_error")}
+                    onChange={(v) =>
+                      setDraft((d) => ({ ...d, calibrationMaxRmsError: v }))
+                    }
+                  />
+                  {err(errors, "calibration.max_rms_error") && (
+                    <p className="field-error" data-testid="err-calibration.max_rms_error">
+                      {err(errors, "calibration.max_rms_error")}
+                    </p>
+                  )}
+                  {err(errors, "calibration.survey_points") && (
+                    <p className="field-error" data-testid="err-calibration.survey_points">
+                      {err(errors, "calibration.survey_points")}
+                    </p>
+                  )}
+                  {err(errors, "calibration.path_points") && (
+                    <p className="field-error" data-testid="err-calibration.path_points">
+                      {err(errors, "calibration.path_points")}
+                    </p>
+                  )}
+                </div>
+                <div className="calibration-column-head">
+                  <span>#</span>
+                  <span>全站仪 X/Y</span>
+                  <span>施工局部 X/Y</span>
+                  <span>操作</span>
+                </div>
+                <ol className="rows calibration-list" data-testid="calibration-pair-list">
+                  {draft.calibrationPairs.map((pair, i) => (
+                    <li key={i} className="row calibration-row">
+                      <span className="row-index">#{i}</span>
+                      <div className="pair-coords">
+                        <NumInput
+                          value={pair.surveyX}
+                          testid={`calibration-survey-${i}-x`}
+                          ariaLabel={`控制点 ${i} 全站仪 X`}
+                          invalid={hasErr(errors, `calibration.survey_points[${i}].x`)}
+                          onChange={(v) => updateCalibrationPair(i, { surveyX: v })}
+                        />
+                        <NumInput
+                          value={pair.surveyY}
+                          testid={`calibration-survey-${i}-y`}
+                          ariaLabel={`控制点 ${i} 全站仪 Y`}
+                          invalid={hasErr(errors, `calibration.survey_points[${i}].y`)}
+                          onChange={(v) => updateCalibrationPair(i, { surveyY: v })}
+                        />
+                      </div>
+                      <div className="pair-coords">
+                        <NumInput
+                          value={pair.pathX}
+                          testid={`calibration-path-${i}-x`}
+                          ariaLabel={`控制点 ${i} 局部 X`}
+                          invalid={hasErr(errors, `calibration.path_points[${i}].x`)}
+                          onChange={(v) => updateCalibrationPair(i, { pathX: v })}
+                        />
+                        <NumInput
+                          value={pair.pathY}
+                          testid={`calibration-path-${i}-y`}
+                          ariaLabel={`控制点 ${i} 局部 Y`}
+                          invalid={hasErr(errors, `calibration.path_points[${i}].y`)}
+                          onChange={(v) => updateCalibrationPair(i, { pathY: v })}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="btn ghost small"
+                        aria-label={`删除控制点 ${i}`}
+                        data-testid={`remove-calibration-pair-${i}`}
+                        disabled={draft.calibrationPairs.length <= 2}
+                        onClick={() =>
+                          setDraft((d) => ({
+                            ...d,
+                            calibrationPairs: d.calibrationPairs.filter(
+                              (_, idx) => idx !== i,
+                            ),
+                          }))
+                        }
+                      >
+                        删除
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+                <button
+                  type="button"
+                  className="btn small"
+                  data-testid="add-calibration-pair"
+                  disabled={draft.calibrationPairs.length >= 20}
+                  onClick={() =>
+                    setDraft((d) => ({
+                      ...d,
+                      calibrationPairs:
+                        d.calibrationPairs.length < 20
+                          ? [
+                              ...d.calibrationPairs,
+                              { surveyX: "", surveyY: "", pathX: "", pathY: "" },
+                            ]
+                          : d.calibrationPairs,
+                    }))
+                  }
+                >
+                  + 控制点对
+                </button>
+              </div>
+            )}
+          </section>
+
           <div className="actions">
             <button type="submit" className="btn primary" data-testid="submit" disabled={loading}>
               {loading ? "预检中…" : "开始预检"}
@@ -441,6 +631,8 @@ export function App() {
               )}
             </div>
           )}
+
+          {result && result.calibration && <CalibrationSummary calibration={result.calibration} />}
 
           {result && !result.feasible && result.intrusion_intervals.length > 0 && (
             <div className="interval-panel" data-testid="interval-panel">

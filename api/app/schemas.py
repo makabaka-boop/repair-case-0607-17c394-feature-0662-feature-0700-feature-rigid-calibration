@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated, List
+from typing import Annotated, List, Tuple
 
 from pydantic import (
     BaseModel,
@@ -38,7 +38,7 @@ def _strict_mm_int(v):
 def _positive_finite(v):
     """正数半径：接受有限的 int/float，拒绝布尔、NaN、Infinity 与非正数值。"""
     if isinstance(v, bool):
-        raise ValueError("半径必须是正数，不能是布尔值")
+        raise ValueError("必须是正数，不能是布尔值")
     if isinstance(v, int):
         f = float(v)
     elif isinstance(v, float):
@@ -47,10 +47,22 @@ def _positive_finite(v):
         # 字符串等类型：交给 StrictFloat/StrictInt 核心报类型错误。
         return v
     if not math.isfinite(f):
-        raise ValueError("半径必须是有限正数（不能是 NaN 或无穷）")
+        raise ValueError("必须是有限正数（不能是 NaN 或无穷）")
     if f <= 0:
-        raise ValueError("半径必须为正数")
+        raise ValueError("必须为正数")
     return f
+
+
+def _strict_finite_number(v):
+    """标定坐标：接受有限 int/float（含小数），拒绝布尔、字符串与非有限值。"""
+    if isinstance(v, bool):
+        raise ValueError("必须是数值，不能是布尔值")
+    if isinstance(v, (int, float)):
+        if not math.isfinite(float(v)):
+            raise ValueError("必须是有限数值（不能是 NaN 或无穷）")
+        return v
+    # 让 float 核心给出统一的 number 类型错误。
+    raise ValueError("必须是数值，不能是字符串或其他类型")
 
 
 # 整数毫米坐标；外层 StrictInt 确保 "NaN" 之类字符串不被宽松解析。
@@ -58,6 +70,9 @@ MmInt = Annotated[StrictInt, BeforeValidator(_strict_mm_int)]
 # 正数半径（可以是小数毫米）；StrictFloat/StrictInt 拒绝字符串。
 PositiveRadius = Annotated[
     StrictFloat | StrictInt, BeforeValidator(_positive_finite)
+]
+FiniteNumber = Annotated[
+    StrictFloat | StrictInt, BeforeValidator(_strict_finite_number)
 ]
 
 
@@ -76,12 +91,49 @@ class StrictCircleIn(BaseModel):
     radius: PositiveRadius
 
 
+class CalibrationPointIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: FiniteNumber
+    y: FiniteNumber
+
+
+class CalibrationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    survey_points: Annotated[List[CalibrationPointIn], Field(min_length=2, max_length=20)]
+    path_points: Annotated[List[CalibrationPointIn], Field(min_length=2, max_length=20)]
+    max_rms_error: PositiveRadius
+
+    @field_validator("survey_points", "path_points")
+    @classmethod
+    def _reject_all_coincident_points(
+        cls, points: List[CalibrationPointIn]
+    ) -> List[CalibrationPointIn]:
+        first = points[0]
+        if all(p.x == first.x and p.y == first.y for p in points[1:]):
+            raise ValueError("控制点不能全部重合")
+        return points
+
+    @field_validator("path_points")
+    @classmethod
+    def _validate_path_points(cls, points: List[CalibrationPointIn], info):
+        first = points[0]
+        if all(p.x == first.x and p.y == first.y for p in points[1:]):
+            raise ValueError("控制点不能全部重合")
+        survey_points = info.data.get("survey_points")
+        if survey_points is not None and len(survey_points) != len(points):
+            raise ValueError("path_points 必须与 survey_points 等长并逐对对应")
+        return points
+
+
 class PrecheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nodes: Annotated[List[StrictPointIn], Field(min_length=2)]
     cable_radius: PositiveRadius
     circles: List[StrictCircleIn]
+    calibration: CalibrationIn | None = None
 
     @field_validator("nodes")
     @classmethod
@@ -171,6 +223,24 @@ class CompoundIntrusionSegmentOut(BaseModel):
     pieces: List[CompoundPieceOut]   # 按原线段切分的片段，供 SVG 高亮
 
 
+RotationMatrixOut = Tuple[Tuple[float, float], Tuple[float, float]]
+
+
+class CalibrationPointResidualOut(BaseModel):
+    index: int
+    survey_point: PointOut
+    path_point: PointOut
+    residual: float
+
+
+class CalibrationOut(BaseModel):
+    rotation: RotationMatrixOut
+    translation: PointOut
+    rms_error: float
+    max_rms_error: float
+    point_residuals: List[CalibrationPointResidualOut]
+
+
 class PrecheckResponse(BaseModel):
     feasible: bool
     cable_radius: float      # 展示用（三位小数）
@@ -183,3 +253,4 @@ class PrecheckResponse(BaseModel):
     compound_intrusion_segments: List[CompoundIntrusionSegmentOut] = Field(
         default_factory=list
     )
+    calibration: CalibrationOut | None = None

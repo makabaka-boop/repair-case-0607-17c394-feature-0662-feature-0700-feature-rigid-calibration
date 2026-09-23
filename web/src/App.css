@@ -320,6 +320,77 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+.calibration-head h2 {
+  margin: 0;
+}
+
+.switch-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.calibration-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.calibration-threshold {
+  max-width: 240px;
+}
+
+.calibration-threshold label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+
+.calibration-column-head,
+.calibration-row {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1.4fr) minmax(0, 1.4fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pair-coords {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.calibration-matrix,
+.calibration-grid {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.7;
+}
+
+.calibration-grid {
+  display: grid;
+  gap: 2px;
+}
+
+.calibration-residuals {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.calibration-residuals li {
+  margin: 2px 0;
+}
+
 .rest-list {
   margin-top: 8px;
   font-size: 13px;

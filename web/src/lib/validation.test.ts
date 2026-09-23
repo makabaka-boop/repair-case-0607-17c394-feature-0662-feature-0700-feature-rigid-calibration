@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { buildPayload, validateDraft, type FormDraft } from "./validation";
 
+const calibrationOff = {
+  calibrationEnabled: false,
+  calibrationMaxRmsError: "1",
+  calibrationPairs: [],
+};
+
 const okDraft: FormDraft = {
   cableRadius: "5",
   nodes: [
@@ -8,7 +14,14 @@ const okDraft: FormDraft = {
     { x: "100", y: "0" },
   ],
   circles: [{ x: "50", y: "30", radius: "10" }],
+  ...calibrationOff,
 };
+
+const calibrationPairs = [
+  { surveyX: "0", surveyY: "0", pathX: "10", pathY: "20" },
+  { surveyX: "1", surveyY: "0", pathX: "11", pathY: "20" },
+  { surveyX: "0", surveyY: "1", pathX: "10", pathY: "21" },
+];
 
 describe("录入校验 validateDraft（与后端字段键一致）", () => {
   it("合法录入无错误", () => {
@@ -72,10 +85,67 @@ describe("录入校验 validateDraft（与后端字段键一致）", () => {
       cableRadius: "-1",
       nodes: [{ x: "x", y: "0" }],
       circles: [{ x: "1", y: "2", radius: "NaN" }],
+      ...calibrationOff,
     };
     const errors = validateDraft(d);
     expect(Object.keys(errors).sort()).toEqual(
       ["cable_radius", "circles[0].radius", "nodes", "nodes[0].x"].sort(),
     );
+  });
+
+  it("标定关闭时载荷省略 calibration", () => {
+    expect("calibration" in buildPayload(okDraft)).toBe(false);
+  });
+
+  it("标定开启时校验成对控制点并生成等长数组", () => {
+    const d: FormDraft = {
+      ...okDraft,
+      calibrationEnabled: true,
+      calibrationMaxRmsError: "0.25",
+      calibrationPairs,
+    };
+    expect(validateDraft(d)).toEqual({});
+    const payload = buildPayload(d);
+    if (!("calibration" in payload)) throw new Error("calibration 应包含在载荷中");
+    expect(payload.calibration).toEqual({
+      survey_points: [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+        { x: 0, y: 1 },
+      ],
+      path_points: [
+        { x: 10, y: 20 },
+        { x: 11, y: 20 },
+        { x: 10, y: 21 },
+      ],
+      max_rms_error: 0.25,
+    });
+  });
+
+  it("标定控制点少于 2 对、非有限或全部重合时字段报错", () => {
+    const onePair: FormDraft = {
+      ...okDraft,
+      calibrationEnabled: true,
+      calibrationPairs: [calibrationPairs[0]],
+    };
+    expect(validateDraft(onePair)["calibration.survey_points"]).toContain("2～20");
+
+    const invalid = calibrationPairs.map((p, i) =>
+      i === 1 ? { ...p, surveyX: "NaN", pathY: "" } : p,
+    );
+    const errors = validateDraft({
+      ...okDraft,
+      calibrationEnabled: true,
+      calibrationPairs: invalid,
+    });
+    expect(errors["calibration.survey_points[1].x"]).toBeTruthy();
+    expect(errors["calibration.path_points[1].y"]).toBeTruthy();
+
+    const sameSurvey = calibrationPairs.map((p) => ({ ...p, surveyX: "5", surveyY: "6" }));
+    expect(
+      validateDraft({ ...okDraft, calibrationEnabled: true, calibrationPairs: sameSurvey })[
+        "calibration.survey_points"
+      ],
+    ).toContain("不能全部重合");
   });
 });
